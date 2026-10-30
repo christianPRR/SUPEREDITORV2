@@ -23,7 +23,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateRotation
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -94,7 +100,7 @@ data class Adj(
 )
 
 data class Geo(val straighten: Float = 0f, val persV: Float = 0f, val persH: Float = 0f)
-data class Snapshot(val bmp: Bitmap, val adj: Adj)
+data class Snapshot(val bmp: Bitmap, val adj: Adj, val layers: List<Layer> = emptyList(), val frame: Frame = Frame())
 data class CropR(val l: Float, val t: Float, val r: Float, val b: Float)
 class FilterDef(val name: String, val m: FloatArray?)
 
@@ -549,31 +555,54 @@ fun EditorScreen() {
     var cropMode by remember { mutableStateOf(false) }
     var crop by remember { mutableStateOf(CropR(0.1f, 0.1f, 0.9f, 0.9f)) }
     var boxSize by remember { mutableStateOf(IntSize.Zero) }
+    val layers = remember { mutableStateListOf<Layer>() }
+    var sel by remember { mutableIntStateOf(-1) }
+    var frame by remember { mutableStateOf(Frame()) }
+    var brushMode by remember { mutableStateOf(false) }
+    var brush by remember { mutableStateOf(BrushCfg()) }
 
     fun commit() {
         val b = bmp ?: return
         saved?.let { undo.add(it) }
         redo.clear()
-        saved = Snapshot(b, adj)
+        saved = Snapshot(b, adj, layers.toList(), frame)
     }
     fun doUndo() {
         val b = bmp ?: return
         if (undo.isEmpty()) return
-        redo.add(Snapshot(b, adj))
+        redo.add(Snapshot(b, adj, layers.toList(), frame))
         val s = undo.removeAt(undo.lastIndex)
-        bmp = s.bmp; adj = s.adj; saved = s
+        bmp = s.bmp; adj = s.adj; saved = s; layers.clear(); layers.addAll(s.layers); frame = s.frame
     }
     fun doRedo() {
         val b = bmp ?: return
         if (redo.isEmpty()) return
-        undo.add(Snapshot(b, adj))
+        undo.add(Snapshot(b, adj, layers.toList(), frame))
         val s = redo.removeAt(redo.lastIndex)
-        bmp = s.bmp; adj = s.adj; saved = s
+        bmp = s.bmp; adj = s.adj; saved = s; layers.clear(); layers.addAll(s.layers); frame = s.frame
     }
     fun geometry(op: (Bitmap) -> Bitmap) {
         val b = bmp ?: return
         bmp = op(b)
         commit()
+    }
+    fun newBase(b: Bitmap) {
+        bmp = b; adj = Adj(); geo = Geo(); cropMode = false; showOriginal = false
+        layers.clear(); sel = -1; frame = Frame(); brushMode = false
+        undo.clear(); redo.clear()
+        saved = Snapshot(b, adj, layers.toList(), frame)
+        exifText = "Imagen creada en la app"
+    }
+    fun flatten() {
+        val b = bmp ?: return
+        val a = adj; val g = geo; val ls = layers.toList()
+        busy = true
+        scope.launch {
+            val nb = withContext(Dispatchers.Default) { composeAll(applyEffects(applyGeo(b, g), a), a, ls, Frame(), null) }
+            bmp = nb; adj = Adj(); geo = Geo(); layers.clear(); sel = -1; brushMode = false
+            busy = false
+            commit()
+        }
     }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -581,8 +610,8 @@ fun EditorScreen() {
             val b = loadBitmap(ctx, it)
             if (b == null) Toast.makeText(ctx, "No se pudo abrir la imagen", Toast.LENGTH_SHORT).show()
             else {
-                bmp = b; adj = Adj(); geo = Geo(); cropMode = false
-                undo.clear(); redo.clear(); saved = Snapshot(b, adj)
+                bmp = b; adj = Adj(); geo = Geo(); cropMode = false; layers.clear(); sel = -1; frame = Frame(); brushMode = false
+                undo.clear(); redo.clear(); saved = Snapshot(b, adj, layers.toList(), frame)
                 exifText = loadExif(ctx, it)
             }
         }
@@ -599,12 +628,16 @@ fun EditorScreen() {
     val small = remember(bmp) { bmp?.let { scaleDown(it, 1024) } }
     var preview by remember(small) { mutableStateOf<Bitmap?>(null) }
     var hist by remember(small) { mutableStateOf<IntArray?>(null) }
-    LaunchedEffect(small, adj, geo) {
+    val layersSnap = layers.toList()
+    val withFrame = tab != TAB_CAPAS
+    LaunchedEffect(small, adj, geo, layersSnap, frame, withFrame) {
         val s = small ?: return@LaunchedEffect
         delay(40)
         val res = withContext(Dispatchers.Default) {
             val e = applyEffects(applyGeo(s, geo), adj)
-            e to histogram(render(e, adj, 256, false))
+            val hh = histogram(render(e, adj, 256, false))
+            val comp = composeAll(e, adj, layersSnap, if (withFrame) frame else Frame(), null)
+            comp to hh
         }
         preview = res.first
         hist = res.second
@@ -637,7 +670,7 @@ fun EditorScreen() {
                         bitmap = img, contentDescription = null,
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit,
-                        colorFilter = if (showOriginal || cropMode) null
+                        colorFilter = if (showOriginal || cropMode || preview != null) null
                         else ColorFilter.colorMatrix(ColorMatrix(buildMatrix(adj).array))
                     )
                     if (cropMode && boxSize.width > 0 && boxSize.height > 0) {
@@ -703,17 +736,71 @@ fun EditorScreen() {
                                 drawCircle(Color.White, 14f, pt)
                         }
                     }
+
+                    if (tab == TAB_CAPAS && !cropMode && boxSize.width > 0 && boxSize.height > 0) {
+                        val bw2 = s.width.toFloat(); val bh2 = s.height.toFloat()
+                        val sc2 = min(boxSize.width / bw2, boxSize.height / bh2)
+                        val iw2 = bw2 * sc2; val ih2 = bh2 * sc2
+                        val ox2 = (boxSize.width - iw2) / 2f; val oy2 = (boxSize.height - ih2) / 2f
+                        Box(
+                            Modifier.fillMaxSize().pointerInput(boxSize, s.width, s.height, brushMode) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown()
+                                    val li = sel
+                                    val cur0 = layers.getOrNull(li)
+                                    if (cur0 == null) {
+                                        do {
+                                            val e0 = awaitPointerEvent()
+                                        } while (e0.changes.any { it.pressed })
+                                        return@awaitEachGesture
+                                    }
+                                    if (brushMode && cur0.kind == 2) {
+                                        val b0 = brush
+                                        val pts = mutableListOf(Pair((down.position.x - ox2) / iw2, (down.position.y - oy2) / ih2))
+                                        layers[li] = cur0.copy(strokes = cur0.strokes + BrushStroke(pts.toList(), b0.color, b0.size, b0.erase))
+                                        do {
+                                            val e1 = awaitPointerEvent()
+                                            e1.changes.forEach { c1 ->
+                                                if (c1.positionChanged()) {
+                                                    pts.add(Pair((c1.position.x - ox2) / iw2, (c1.position.y - oy2) / ih2))
+                                                    c1.consume()
+                                                }
+                                            }
+                                            layers[li] = cur0.copy(strokes = cur0.strokes + BrushStroke(pts.toList(), b0.color, b0.size, b0.erase))
+                                        } while (e1.changes.any { it.pressed })
+                                        commit()
+                                    } else {
+                                        do {
+                                            val e2 = awaitPointerEvent()
+                                            val pan = e2.calculatePan()
+                                            val zoom = e2.calculateZoom()
+                                            val rot = e2.calculateRotation()
+                                            val l2 = layers.getOrNull(li)
+                                            if (l2 != null) {
+                                                layers[li] = l2.copy(
+                                                    cx = l2.cx + pan.x / iw2, cy = l2.cy + pan.y / ih2,
+                                                    scale = (l2.scale * zoom).coerceIn(0.1f, 6f), rot = l2.rot + rot
+                                                )
+                                            }
+                                            e2.changes.forEach { if (it.positionChanged()) it.consume() }
+                                        } while (e2.changes.any { it.pressed })
+                                        commit()
+                                    }
+                                }
+                            }
+                        ) {}
+                    }
                 }
             }
 
             ScrollableTabRow(selectedTabIndex = tab, edgePadding = 0.dp) {
-                listOf("Recortar", "Ajustes", "Detalle", "Color", "Filtros", "Info").forEachIndexed { i, t ->
+                listOf("Recortar", "Ajustes", "Detalle", "Color", "Filtros", "Capas", "Diseño", "Info").forEachIndexed { i, t ->
                     Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) })
                 }
             }
             val has = bmp != null
             Column(
-                Modifier.fillMaxWidth().heightIn(max = 240.dp).verticalScroll(rememberScrollState()).padding(8.dp),
+                Modifier.fillMaxWidth().heightIn(max = 280.dp).verticalScroll(rememberScrollState()).padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 when (tab) {
@@ -789,6 +876,11 @@ fun EditorScreen() {
                         if (adj.cube != null)
                             SliderRow("Intensidad LUT", adj.cubeStrength, 0f..1f, { adj = adj.copy(cubeStrength = it) }, ::commit)
                     }
+                    5 -> LayersPanel(
+                        layers, sel, { sel = it }, brushMode, { brushMode = it }, brush, { brush = it },
+                        bmp?.width ?: 1, bmp?.height ?: 1, ::commit, ::flatten
+                    )
+                    6 -> DesignPanel(frame, { frame = it }, ::commit, ::newBase)
                     else -> {
                         Text("Histograma (RGB)", style = MaterialTheme.typography.labelLarge)
                         Histogram(hist, Modifier.fillMaxWidth().height(90.dp).background(Color(0xFF202020)))
@@ -815,13 +907,15 @@ fun EditorScreen() {
                 val src = bmp!!
                 val adjNow = adj
                 val geoNow = geo
+                val layersNow = layers.toList()
+                val frameNow = frame
                 showExport = false
                 busy = true
                 scope.launch {
                     val res = withContext(Dispatchers.Default) {
                         try {
                             val e = applyEffects(applyGeo(src, geoNow), adjNow)
-                            val out = render(e, adjNow, side, whiteBg = fmt == 0)
+                            val out = composeAll(e, adjNow, layersNow, frameNow, side, fmt == 0)
                             saveToGallery(ctx, out, fmt, quality)
                         } catch (t: Throwable) { null }
                     }
