@@ -1,3 +1,4 @@
+
 package com.example.editorfoto
 
 import android.content.ContentValues
@@ -455,7 +456,7 @@ fun loadExif(ctx: Context, uri: Uri): String {
             add("Fecha", ExifInterface.TAG_DATETIME)
             add("Exposición (s)", ExifInterface.TAG_EXPOSURE_TIME)
             add("Apertura f/", ExifInterface.TAG_F_NUMBER)
-            add("ISO", ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
+            add("ISO", "ISOSpeedRatings")
             add("Distancia focal", ExifInterface.TAG_FOCAL_LENGTH)
             add("Ancho original", ExifInterface.TAG_IMAGE_WIDTH)
             add("Alto original", ExifInterface.TAG_IMAGE_LENGTH)
