@@ -937,7 +937,7 @@ fun EditorScreen() {
             }
 
             ScrollableTabRow(selectedTabIndex = tab, edgePadding = 0.dp) {
-                listOf("Recortar", "Ajustes", "Detalle", "Color", "Filtros", "Capas", "Diseño", "Retoque", "Fondo", "Proyecto", "Info").forEachIndexed { i, t ->
+                listOf("Recortar", "Ajustes", "Detalle", "Color", "Filtros", "Capas", "Diseño", "Retoque", "Fondo", "Proyecto", "IA", "Info").forEachIndexed { i, t ->
                     Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) })
                 }
             }
@@ -1072,6 +1072,7 @@ fun EditorScreen() {
                         }
                     )
                     9 -> ProjectPanel({ saveProj(it) }, { openProj(it) }, { batch(it) })
+                    10 -> AiPanel(bmp != null) { req -> runEdit { b -> callGemini(ctx, b, req.prompt, req.expandIdx) } }
                     else -> {
                         Text("Histograma (RGB)", style = MaterialTheme.typography.labelLarge)
                         Histogram(hist, Modifier.fillMaxWidth().height(90.dp).background(Color(0xFF202020)))
