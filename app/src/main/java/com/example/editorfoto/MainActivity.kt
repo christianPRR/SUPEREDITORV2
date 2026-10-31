@@ -560,6 +560,12 @@ fun EditorScreen() {
     var frame by remember { mutableStateOf(Frame()) }
     var brushMode by remember { mutableStateOf(false) }
     var brush by remember { mutableStateOf(BrushCfg()) }
+    var subject by remember { mutableStateOf<SubjectMask?>(null) }
+    var retMode by remember { mutableIntStateOf(0) }
+    var retSize by remember { mutableFloatStateOf(0.05f) }
+    var cloneSrc by remember { mutableStateOf<Pair<Float, Float>?>(null) }
+    var cloneOff by remember { mutableStateOf<Pair<Float, Float>?>(null) }
+    val strokeUi = remember { mutableStateListOf<Offset>() }
 
     fun commit() {
         val b = bmp ?: return
@@ -592,6 +598,81 @@ fun EditorScreen() {
         undo.clear(); redo.clear()
         saved = Snapshot(b, adj, layers.toList(), frame)
         exifText = "Imagen creada en la app"
+    }
+    fun toast(m: String) { Toast.makeText(ctx, m, Toast.LENGTH_LONG).show() }
+    fun runEdit(work: suspend (Bitmap) -> Bitmap?) {
+        val b = bmp ?: return
+        busy = true
+        scope.launch {
+            try {
+                val nb = work(b)
+                if (nb != null) { bmp = nb; commit() }
+            } catch (t: Throwable) {
+                toast("Error: ${t.message}")
+            }
+            busy = false
+        }
+    }
+    fun validMask(b: Bitmap): SubjectMask? = subject?.takeIf { it.src === b }
+    fun detect(objects: Boolean) {
+        val b = bmp ?: return
+        busy = true
+        scope.launch {
+            try {
+                subject = detectSubject(b, objects)
+                toast("Sujeto detectado")
+            } catch (t: Throwable) {
+                toast("No se pudo detectar: ${t.message}")
+            }
+            busy = false
+        }
+    }
+    fun saveProj(uri: Uri) {
+        val b = bmp ?: return
+        val a = adj; val g = geo; val f = frame; val ls = layers.toList()
+        busy = true
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                try { saveProject(ctx, uri, b, a, g, f, ls); true } catch (t: Throwable) { false }
+            }
+            busy = false
+            toast(if (ok) "Proyecto guardado" else "Error al guardar el proyecto")
+        }
+    }
+    fun openProj(uri: Uri) {
+        busy = true
+        scope.launch {
+            val pr = withContext(Dispatchers.Default) { loadProject(ctx, uri) }
+            if (pr == null) toast("No se pudo abrir el proyecto")
+            else {
+                bmp = pr.bmp; adj = pr.adj; geo = pr.geo; frame = pr.frame
+                layers.clear(); layers.addAll(pr.layers)
+                sel = -1; cropMode = false; brushMode = false; subject = null
+                undo.clear(); redo.clear()
+                saved = Snapshot(pr.bmp, pr.adj, layers.toList(), frame)
+                exifText = "Proyecto abierto"
+            }
+            busy = false
+        }
+    }
+    fun batch(uris: List<Uri>) {
+        val a = adj; val ls = layers.toList(); val fr = frame
+        busy = true
+        scope.launch {
+            var ok = 0
+            for (u in uris) {
+                val r = withContext(Dispatchers.Default) {
+                    try {
+                        val src = loadBitmap(ctx, u)
+                        if (src == null) null
+                        else saveToGallery(ctx, composeAll(applyEffects(src, a), a, ls, fr, null, true), 0, 92)
+                    } catch (t: Throwable) { null }
+                }
+                if (r != null) ok++
+            }
+            busy = false
+            toast("$ok de ${uris.size} fotos guardadas en Pictures/EditorFoto")
+        }
     }
     fun flatten() {
         val b = bmp ?: return
@@ -629,7 +710,7 @@ fun EditorScreen() {
     var preview by remember(small) { mutableStateOf<Bitmap?>(null) }
     var hist by remember(small) { mutableStateOf<IntArray?>(null) }
     val layersSnap = layers.toList()
-    val withFrame = tab != TAB_CAPAS
+    val withFrame = tab != TAB_CAPAS && tab != TAB_RETOQUE
     LaunchedEffect(small, adj, geo, layersSnap, frame, withFrame) {
         val s = small ?: return@LaunchedEffect
         delay(40)
@@ -790,11 +871,73 @@ fun EditorScreen() {
                             }
                         ) {}
                     }
+
+                    if (tab == TAB_RETOQUE && !cropMode && boxSize.width > 0 && boxSize.height > 0) {
+                        val bw3 = s.width.toFloat(); val bh3 = s.height.toFloat()
+                        val sc3 = min(boxSize.width / bw3, boxSize.height / bh3)
+                        val iw3 = bw3 * sc3; val ih3 = bh3 * sc3
+                        val ox3 = (boxSize.width - iw3) / 2f; val oy3 = (boxSize.height - ih3) / 2f
+                        Canvas(
+                            Modifier.fillMaxSize().pointerInput(boxSize, s.width, s.height) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown()
+                                    fun norm(o: Offset) = Pair(((o.x - ox3) / iw3).coerceIn(0f, 1f), ((o.y - oy3) / ih3).coerceIn(0f, 1f))
+                                    if (bmp == null) {
+                                        do {
+                                            val e0 = awaitPointerEvent()
+                                        } while (e0.changes.any { it.pressed })
+                                        return@awaitEachGesture
+                                    }
+                                    if (retMode == 1 && cloneSrc == null) {
+                                        cloneSrc = norm(down.position)
+                                        Toast.makeText(ctx, "Origen fijado. Ahora pinta donde quieras copiar.", Toast.LENGTH_SHORT).show()
+                                        do {
+                                            val e1 = awaitPointerEvent()
+                                        } while (e1.changes.any { it.pressed })
+                                        return@awaitEachGesture
+                                    }
+                                    val pts = mutableListOf(norm(down.position))
+                                    strokeUi.clear()
+                                    strokeUi.add(down.position)
+                                    if (retMode == 1 && cloneOff == null) {
+                                        val s0 = cloneSrc!!
+                                        cloneOff = Pair(s0.first - pts[0].first, s0.second - pts[0].second)
+                                    }
+                                    do {
+                                        val e2 = awaitPointerEvent()
+                                        e2.changes.forEach { c2 ->
+                                            if (c2.positionChanged()) {
+                                                pts.add(norm(c2.position))
+                                                strokeUi.add(c2.position)
+                                                c2.consume()
+                                            }
+                                        }
+                                    } while (e2.changes.any { it.pressed })
+                                    strokeUi.clear()
+                                    val mode = retMode
+                                    val rad = retSize
+                                    val off = cloneOff ?: Pair(0f, 0f)
+                                    val ptsList = pts.toList()
+                                    runEdit { b ->
+                                        withContext(Dispatchers.Default) {
+                                            if (mode == 0) inpaintStroke(b, ptsList, rad) else cloneStroke(b, ptsList, rad, off)
+                                        }
+                                    }
+                                }
+                            }
+                        ) {
+                            val rr = retSize * iw3 / 2f
+                            for (pt in strokeUi) drawCircle(Color(0x66FF3030), rr, pt)
+                            cloneSrc?.let {
+                                drawCircle(Color(0xCC00E5FF), rr, Offset(ox3 + it.first * iw3, oy3 + it.second * ih3), style = Stroke(3f))
+                            }
+                        }
+                    }
                 }
             }
 
             ScrollableTabRow(selectedTabIndex = tab, edgePadding = 0.dp) {
-                listOf("Recortar", "Ajustes", "Detalle", "Color", "Filtros", "Capas", "Diseño", "Info").forEachIndexed { i, t ->
+                listOf("Recortar", "Ajustes", "Detalle", "Color", "Filtros", "Capas", "Diseño", "Retoque", "Fondo", "Proyecto", "Info").forEachIndexed { i, t ->
                     Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) })
                 }
             }
@@ -881,6 +1024,54 @@ fun EditorScreen() {
                         bmp?.width ?: 1, bmp?.height ?: 1, ::commit, ::flatten
                     )
                     6 -> DesignPanel(frame, { frame = it }, ::commit, ::newBase)
+                    7 -> RetouchPanel(
+                        retMode, { retMode = it }, retSize, { retSize = it },
+                        cloneSrc != null, { cloneSrc = null; cloneOff = null },
+                        { st -> runEdit { b -> faceEdit(b, 0, st) ?: run { toast("No se detectó un rostro"); null } } },
+                        { runEdit { b -> faceEdit(b, 1, 1f) ?: run { toast("No se detectó boca abierta/dientes"); null } } },
+                        { runEdit { b -> faceEdit(b, 2, 1f) ?: run { toast("No se detectaron ojos"); null } } }
+                    )
+                    8 -> BackgroundPanel(
+                        hasMask = bmp != null && subject?.src === bmp,
+                        onDetect = { detect(it) },
+                        onRemove = {
+                            runEdit { b ->
+                                val m = validMask(b)
+                                if (m == null) { toast("Primero detecta el sujeto"); null }
+                                else withContext(Dispatchers.Default) { cutout(b, m) }
+                            }
+                        },
+                        onColor = { c ->
+                            runEdit { b ->
+                                val m = validMask(b)
+                                if (m == null) { toast("Primero detecta el sujeto"); null }
+                                else withContext(Dispatchers.Default) { replaceBg(b, m, null, c) }
+                            }
+                        },
+                        onPhoto = { bg ->
+                            runEdit { b ->
+                                val m = validMask(b)
+                                if (m == null) { toast("Primero detecta el sujeto"); null }
+                                else withContext(Dispatchers.Default) { replaceBg(b, m, bg, 0) }
+                            }
+                        },
+                        onBlur = { st ->
+                            runEdit { b ->
+                                val m = validMask(b)
+                                if (m == null) { toast("Primero detecta el sujeto"); null }
+                                else withContext(Dispatchers.Default) { blurBg(b, m, st) }
+                            }
+                        },
+                        onSky = { preset, photo ->
+                            runEdit { b ->
+                                val m = validMask(b)
+                                val r = withContext(Dispatchers.Default) { replaceSky(b, preset, photo, m) }
+                                if (r == null) toast("No se detectó cielo en la foto")
+                                r
+                            }
+                        }
+                    )
+                    9 -> ProjectPanel({ saveProj(it) }, { openProj(it) }, { batch(it) })
                     else -> {
                         Text("Histograma (RGB)", style = MaterialTheme.typography.labelLarge)
                         Histogram(hist, Modifier.fillMaxWidth().height(90.dp).background(Color(0xFF202020)))
